@@ -93,9 +93,22 @@ def get_devices() -> dict[str, dict]:
 
 
 def notify_mac(title: str, message: str) -> None:
-    script = f'display notification "{message}" with title "{title}" subtitle "Subtitle" sound name "Ping"'
-    subprocess.run(["osascript", "-e", script])
-    logger.info(f"Notification sent - {title}: {message}")
+    click_action = "open http://127.0.0.1:8384"
+
+    command = [
+        "terminal-notifier",
+        "-title", title,
+        "-message", message,
+        "-execute", click_action,
+        "-group", "syncthing-alerts",
+        "-sound", "ping"
+    ]
+
+    try:
+        subprocess.run(command, check=True)
+        logger.info(f"Syncthing Web UI notification sent: {title}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to send notification: {e}")
 
 
 def get_system_connection_status() -> Union[dict[str, bool], None]:
