@@ -2,6 +2,8 @@ from typing import Union
 
 import requests
 import os
+import shutil
+import sys
 
 import subprocess
 import time
@@ -32,9 +34,16 @@ logger.addHandler(file_handler)
 
 # -------- Configuration --------
 API_KEY = os.environ.get("SYNCTHING_API_KEY", "")
+ENABLE_SYSTEM_UPTIME_DETECTION = os.environ.get("ENABLE_SYSTEM_UPTIME_DETECTION", "false").lower() == "true"
 BASE_URL = "http://localhost:8384/rest"
 
 SYNCTHING_PATH = "/Applications/Syncthing.app/Contents/Resources/syncthing/syncthing"
+TERMINAL_NOTIFIER_PATH = (
+    os.environ.get("TERMINAL_NOTIFIER_PATH")
+    or shutil.which("terminal-notifier")
+    or "/opt/homebrew/bin/terminal-notifier"
+    or "/usr/local/bin/terminal-notifier"
+)
 
 
 def call_syncthing_api(endpoint: str, params: dict = None, timeout: int = 10) -> Union[dict, None]:
@@ -96,7 +105,7 @@ def notify_mac(title: str, message: str) -> None:
     click_action = "open http://127.0.0.1:8384"
 
     command = [
-        "terminal-notifier",
+        TERMINAL_NOTIFIER_PATH,
         "-title", title,
         "-message", message,
         "-execute", click_action,
@@ -107,8 +116,25 @@ def notify_mac(title: str, message: str) -> None:
     try:
         subprocess.run(command, check=True)
         logger.info(f"Syncthing Web UI notification sent: {title}")
+    except FileNotFoundError:
+        logger.warning("terminal-notifier not found, falling back to osascript notification")
+        fallback_command = [
+            "/usr/bin/osascript",
+            "-e",
+            f'display notification "{message}" with title "{title}" sound name "Ping"',
+        ]
+        try:
+            subprocess.run(fallback_command, check=True)
+            logger.info(f"Fallback notification sent: {title}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to send fallback notification: {e}")
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to send notification: {e}")
+
+
+def run_self_test() -> None:
+    logger.info("Running notification self-test...")
+    notify_mac("Syncthing Monitor Test", "Test notification from syncthing-monitor")
 
 
 def get_system_connection_status() -> Union[dict[str, bool], None]:
@@ -128,7 +154,8 @@ def get_system_connection_status() -> Union[dict[str, bool], None]:
 def check_system_errors() -> bool:
     sys_errors = call_syncthing_api("system/error")
     if sys_errors and sys_errors.get("errors"):
-        alert_message = f"{sys_errors["errors"][0]["message"]} at {sys_errors["errors"][0]["when"]}"
+        first_error = sys_errors["errors"][0]
+        alert_message = f"{first_error['message']} at {first_error['when']}"
         logger.error(f"System error: {alert_message}")
         notify_mac("Syncthing System Error", alert_message)
         return True
@@ -148,6 +175,20 @@ def check_folder_sync_errors(folder: dict, folder_errors_data: dict) -> list:
     return issues
 
 
+def check_disconnected_devices(device_details, my_device_id, system_connection_status) -> list:
+    issues = []
+    for device_id, is_connected in system_connection_status.items():
+        if device_id == my_device_id or is_connected:
+            continue
+
+        device_name = device_details.get(device_id, {}).get("name", device_id)
+        issue = f"Device {device_name} is disconnected"
+        issues.append(issue)
+        logger.warning(issue)
+
+    return issues
+
+
 def check_device_sync_status(folder, device_entry, device_details, my_device_id, system_connection_status):
     issues = []
     d_id = device_entry["deviceID"]
@@ -157,11 +198,9 @@ def check_device_sync_status(folder, device_entry, device_details, my_device_id,
 
     completion = call_syncthing_api("db/completion", {"folder": f_id, "device": d_id})
     if completion:
-        if d_id != my_device_id and not system_connection_status[d_id]:
-            # for now, I don't care if a device is offline. As long as they are connected/online at some point, they will sync.
-            # I only care about devices that are connected but not in-sync.
-            pass
-        elif completion.get("completion") < 100:
+        if d_id != my_device_id and not system_connection_status.get(d_id, False):
+            return issues
+        if completion.get("completion") < 100:
             needed = completion.get("needItems", 0)
             issue = f"Device {d_name} needs {needed} items in '{f_label}'"
             issues.append(issue)
@@ -198,6 +237,7 @@ def run_health_check():
         return
 
     issues = []
+    issues.extend(check_disconnected_devices(device_details, my_device_id, system_connection_status))
 
     for folder in folders:
         f_id = folder['id']
@@ -222,4 +262,9 @@ def run_health_check():
 
 
 if __name__ == "__main__":
-    run_health_check()
+    if "--self-test" in sys.argv:
+        run_self_test()
+    else:
+        run_health_check()
+        if ENABLE_SYSTEM_UPTIME_DETECTION:
+            logger.info("System uptime detection is enabled, but not implemented yet.")
