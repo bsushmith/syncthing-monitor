@@ -36,6 +36,8 @@ logger.addHandler(file_handler)
 API_KEY = os.environ.get("SYNCTHING_API_KEY", "")
 ENABLE_SYSTEM_UPTIME_DETECTION = os.environ.get("ENABLE_SYSTEM_UPTIME_DETECTION", "false").lower() == "true"
 BASE_URL = "http://localhost:8384/rest"
+DISCONNECT_RETRY_COUNT = max(0, int(os.environ.get("DISCONNECT_RETRY_COUNT", "3")))
+DISCONNECT_RETRY_DELAY_SECONDS = max(1, int(os.environ.get("DISCONNECT_RETRY_DELAY_SECONDS", "20")))
 
 SYNCTHING_PATH = "/Applications/Syncthing.app/Contents/Resources/syncthing/syncthing"
 TERMINAL_NOTIFIER_PATH = (
@@ -141,7 +143,7 @@ def get_system_connection_status() -> Union[dict[str, bool], None]:
     response_json = call_syncthing_api(endpoint="system/connections", params={}, timeout=10)
 
     if not response_json:
-        logger.error(f"Error fetching system connections")
+        logger.error("Error fetching system connections")
         return None
 
     connections = response_json.get("connections", {})
@@ -149,6 +151,60 @@ def get_system_connection_status() -> Union[dict[str, bool], None]:
     for device_id, detail in connections.items():
         connection_status[device_id] = detail.get("connected", False)
     return connection_status
+
+
+def retry_disconnected_devices(
+    device_details: dict[str, dict],
+    my_device_id: str,
+    system_connection_status: dict[str, bool],
+) -> dict[str, bool]:
+    disconnected_ids = [
+        device_id for device_id, is_connected in system_connection_status.items()
+        if device_id != my_device_id and not is_connected
+    ]
+
+    if not disconnected_ids:
+        return system_connection_status
+
+    for attempt in range(1, DISCONNECT_RETRY_COUNT + 1):
+        disconnected_names = ", ".join(
+            device_details.get(device_id, {}).get("name", device_id)
+            for device_id in disconnected_ids
+        )
+        logger.warning(
+            "Disconnected devices detected (%s). Retrying connection check %s/%s in %ss.",
+            disconnected_names,
+            attempt,
+            DISCONNECT_RETRY_COUNT,
+            DISCONNECT_RETRY_DELAY_SECONDS,
+        )
+        time.sleep(DISCONNECT_RETRY_DELAY_SECONDS)
+
+        refreshed_status = get_system_connection_status()
+        if not refreshed_status:
+            logger.error("Retry connection check failed; keeping previous connection status.")
+            continue
+
+        system_connection_status = refreshed_status
+        disconnected_ids = [
+            device_id for device_id in disconnected_ids
+            if not system_connection_status.get(device_id, False)
+        ]
+
+        if not disconnected_ids:
+            logger.info("All previously disconnected devices reconnected during retry window.")
+            return system_connection_status
+
+    disconnected_names = ", ".join(
+        device_details.get(device_id, {}).get("name", device_id)
+        for device_id in disconnected_ids
+    )
+    logger.error(
+        "Devices still disconnected after %s retries: %s",
+        DISCONNECT_RETRY_COUNT,
+        disconnected_names,
+    )
+    return system_connection_status
 
 
 def check_system_errors() -> bool:
@@ -162,7 +218,7 @@ def check_system_errors() -> bool:
     return False
 
 
-def check_folder_sync_errors(folder: dict, folder_errors_data: dict) -> list:
+def check_folder_sync_errors(folder: dict, folder_errors_data: dict | None) -> list:
     issues = []
     f_id = folder['id']
     f_label = folder.get('label', f_id)
@@ -200,13 +256,18 @@ def check_device_sync_status(folder, device_entry, device_details, my_device_id,
     if completion:
         if d_id != my_device_id and not system_connection_status.get(d_id, False):
             return issues
-        if completion.get("completion") < 100:
-            needed = completion.get("needItems", 0)
+        completion_percent = completion.get("completion")
+        if completion_percent is None:
+            logger.warning(f"Device {d_name} completion response for '{f_label}' did not include completion percent")
+            return issues
+
+        needed = completion.get("needItems", 0)
+        if completion_percent < 100:
             issue = f"Device {d_name} needs {needed} items in '{f_label}'"
             issues.append(issue)
             logger.warning(issue)
-        elif completion.get("completion") == 100 and completion.get("needItems", 0) > 0:
-            issue = f"Device {d_name} is showing 100% but still needs {completion.get('needItems', 0)} items in '{f_label}'"
+        elif completion_percent == 100 and needed > 0:
+            issue = f"Device {d_name} is showing 100% but still needs {needed} items in '{f_label}'"
             issues.append(issue)
             logger.warning(issue)
 
@@ -232,9 +293,15 @@ def run_health_check():
     my_device_id = get_syncthing_device_id()
     system_connection_status = get_system_connection_status()
 
-    if not all([device_details, my_device_id, system_connection_status]):
+    if not device_details or not my_device_id or system_connection_status is None:
         logger.error("Failed to get required system information!")
         return
+
+    system_connection_status = retry_disconnected_devices(
+        device_details,
+        my_device_id,
+        system_connection_status,
+    )
 
     issues = []
     issues.extend(check_disconnected_devices(device_details, my_device_id, system_connection_status))
